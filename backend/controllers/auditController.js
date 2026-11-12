@@ -4,11 +4,28 @@ import { createHash } from 'node:crypto';
 
 import Brand from '../models/Brand.js';
 import Audit from '../models/Audit.js';
+
 import {
   analyzeContent,
   analyzeFile
 } from '../services/auditService.js';
 
+const ALLOWED_CHANNELS = [
+  'general',
+  'social_media',
+  'email',
+  'website',
+  'advertisement',
+  'campaign'
+];
+
+const ALLOWED_REVIEWER_ROLES = [
+  'admin',
+  'reviewer',
+  'viewer'
+];
+
+// Validate uploaded file signatures
 function isValidFileSignature(file) {
   const buffer = file.buffer;
 
@@ -37,6 +54,7 @@ function isValidFileSignature(file) {
   return false;
 }
 
+// Create a new content audit
 export async function auditContent(req, res, next) {
   try {
     const { brandId, content } = req.body;
@@ -49,7 +67,19 @@ export async function auditContent(req, res, next) {
       });
     }
 
-    if (!file && (typeof content !== 'string' || !content.trim())) {
+    const channel = req.body.channel || 'general';
+
+    if (!ALLOWED_CHANNELS.includes(channel)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid content channel.'
+      });
+    }
+
+    if (!file && (
+      typeof content !== 'string' ||
+      !content.trim()
+    )) {
       return res.status(400).json({
         success: false,
         message: 'Enter content or upload an image/PDF.'
@@ -86,9 +116,12 @@ export async function auditContent(req, res, next) {
     const fileMetadata = {};
 
     if (file) {
-      sourceType = file.mimetype === 'application/pdf' ? 'pdf' : 'image';
+      sourceType =
+        file.mimetype === 'application/pdf'
+          ? 'pdf'
+          : 'image';
 
-      result = await analyzeFile(brand, file);
+      result = await analyzeFile(brand, file, channel);
 
       const safeFileName =
         file.originalname.split(/[\\/]/).pop().slice(0, 200);
@@ -103,13 +136,19 @@ export async function auditContent(req, res, next) {
       });
 
       submittedContent = `Uploaded ${sourceType}: ${safeFileName}`;
+
     } else {
-      result = await analyzeContent(brand, submittedContent);
+      result = await analyzeContent(
+        brand,
+        submittedContent,
+        channel
+      );
     }
 
     const audit = await Audit.create({
       brand: brand._id,
       sourceType,
+      channel,
       submittedContent,
       ...fileMetadata,
       overallStatus: result.overallStatus,
@@ -122,11 +161,13 @@ export async function auditContent(req, res, next) {
       message: 'Content audit completed.',
       audit
     });
+
   } catch (error) {
     return next(error);
   }
 }
 
+// Get audit history
 export async function getAudits(req, res, next) {
   try {
     const filter = {};
@@ -153,11 +194,13 @@ export async function getAudits(req, res, next) {
       count: audits.length,
       audits
     });
+
   } catch (error) {
     return next(error);
   }
 }
 
+// Get one audit by ID
 export async function getAuditById(req, res, next) {
   try {
     if (!mongoose.isValidObjectId(req.params.auditId)) {
@@ -177,16 +220,27 @@ export async function getAuditById(req, res, next) {
       });
     }
 
-    return res.json({ success: true, audit });
+    return res.json({
+      success: true,
+      audit
+    });
+
   } catch (error) {
     return next(error);
   }
 }
 
+// Approve or reject a finding and record review history
 export async function reviewFinding(req, res, next) {
   try {
     const { auditId, findingId } = req.params;
-    const { decision } = req.body;
+
+    const {
+      decision,
+      reviewerName,
+      reviewerRole,
+      note = ''
+    } = req.body;
 
     if (!mongoose.isValidObjectId(auditId)) {
       return res.status(400).json({
@@ -195,10 +249,45 @@ export async function reviewFinding(req, res, next) {
       });
     }
 
+    if (!mongoose.isValidObjectId(findingId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid finding ID.'
+      });
+    }
+
     if (!['approved', 'rejected'].includes(decision)) {
       return res.status(400).json({
         success: false,
-        message: 'decision must be approved or rejected.'
+        message: 'Decision must be approved or rejected.'
+      });
+    }
+
+    if (
+      typeof reviewerName !== 'string' ||
+      !reviewerName.trim() ||
+      reviewerName.trim().length > 80
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid reviewer name is required (maximum 80 characters).'
+      });
+    }
+
+    if (!ALLOWED_REVIEWER_ROLES.includes(reviewerRole)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid reviewer role.'
+      });
+    }
+
+    if (
+      typeof note !== 'string' ||
+      note.length > 500
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'Review note must be 500 characters or fewer.'
       });
     }
 
@@ -221,13 +310,126 @@ export async function reviewFinding(req, res, next) {
     }
 
     finding.reviewStatus = decision;
+
+    finding.reviewHistory.push({
+      decision,
+      reviewerName: reviewerName.trim(),
+      reviewerRole,
+      note: note.trim(),
+      reviewedAt: new Date()
+    });
+
     await audit.save();
 
     return res.json({
       success: true,
-      message: `Finding ${decision}.`,
+      message: `Finding ${decision} successfully.`,
       audit
     });
+
+  } catch (error) {
+    return next(error);
+  }
+}
+
+// Governance analytics dashboard
+export async function getAuditAnalytics(req, res, next) {
+  try {
+    const [
+      totalAudits,
+      statusStats,
+      channelStats,
+      categoryStats,
+      monthlyStats,
+      reviewStats
+    ] = await Promise.all([
+
+      // Total audits
+      Audit.countDocuments(),
+
+      // Audit status breakdown
+      Audit.aggregate([
+        {
+          $group: {
+            _id: '$overallStatus',
+            count: { $sum: 1 }
+          }
+        }
+      ]),
+
+      // Audits by channel
+      // Older audits without a channel are counted as General
+      Audit.aggregate([
+        {
+          $group: {
+            _id: { $ifNull: ['$channel', 'general'] },
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $sort: { count: -1 }
+        }
+      ]),
+
+      // Violations by category and severity
+      Audit.aggregate([
+        { $unwind: '$findings' },
+        {
+          $group: {
+            _id: '$findings.category',
+            count: { $sum: 1 },
+            highSeverity: {
+              $sum: {
+                $cond: [
+                  { $eq: ['$findings.severity', 'high'] },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
+        },
+        { $sort: { count: -1 } }
+      ]),
+
+      // Monthly audit trends
+      Audit.aggregate([
+        {
+          $group: {
+            _id: {
+              year: { $year: '$createdAt' },
+              month: { $month: '$createdAt' }
+            },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { '_id.year': 1, '_id.month': 1 } }
+      ]),
+
+      // Approval and rejection statistics
+      Audit.aggregate([
+        { $unwind: '$findings' },
+        {
+          $group: {
+            _id: '$findings.reviewStatus',
+            count: { $sum: 1 }
+          }
+        }
+      ])
+    ]);
+
+    return res.json({
+      success: true,
+      analytics: {
+        totalAudits,
+        statusStats,
+        channelStats,
+        categoryStats,
+        monthlyStats,
+        reviewStats
+      }
+    });
+
   } catch (error) {
     return next(error);
   }

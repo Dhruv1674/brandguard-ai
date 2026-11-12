@@ -6,7 +6,8 @@ import {
   auditContent,
   getAudits,
   getAuditById,
-  reviewFinding
+  reviewFinding,
+  getAuditAnalytics
 } from '../controllers/auditController.js';
 
 const router = Router();
@@ -36,6 +37,10 @@ const upload = multer({
 });
 
 router.post('/check', upload.single('file'), auditContent);
+
+// Keep analytics before the dynamic audit ID route
+router.get('/analytics', getAuditAnalytics);
+
 router.get('/', getAudits);
 router.get('/:auditId', getAuditById);
 router.patch('/:auditId/findings/:findingId/review', reviewFinding);
